@@ -481,7 +481,7 @@ function renderHeader(){
     </button>
     <div class="user-chip">
       ${userInfo.picture?`<img class="user-avatar" src="${userInfo.picture}" alt="">`:''}
-      <span class="user-name">${userInfo.name||userInfo.email}</span>
+      <span class="user-name">${userInfo.name||userInfo.given_name||userInfo.email||'사용자'}</span>
       <button class="btn-logout" onclick="signOut()">로그아웃</button>
     </div>`;
 }
