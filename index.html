@@ -507,8 +507,15 @@ async function syncDrive(){
       if(!folderIds.length) continue;
 
       for(const folderId of folderIds){
-        const files = await listFiles(folderId);
-        files.forEach(f => {
+        const rawFiles = await listFiles(folderId);
+        const files = matchMusic(rawFiles);
+        // 음악 파일 자체는 카드에 표시 안 함
+        const musicExts = ['mp3','wav','ogg','aac','m4a','flac'];
+        const viewFiles = files.filter(f => {
+          const ext = (f.name.split('.').pop()||'').toLowerCase();
+          return !musicExts.includes(ext);
+        });
+        viewFiles.forEach(f => {
           // 중복 파일 제거
           if(!allFiles.find(x => x.id === f.id)){
             allFiles.push({
@@ -521,6 +528,8 @@ async function syncDrive(){
               iconLink: f.iconLink,
               modifiedTime: f.modifiedTime,
               thumbnailLink: f.thumbnailLink,
+              musicFileId: f.musicFileId||null,
+              musicFileName: f.musicFileName||null,
             });
           }
         });
@@ -559,6 +568,28 @@ async function listFiles(folderId){
   const r = await gFetch(url);
   const data = await r.json();
   return data.files || [];
+}
+
+// 파일명(확장자 제거)으로 음악 파일 매칭
+function matchMusic(files){
+  const musicExts = ['mp3','wav','ogg','aac','m4a','flac'];
+  const musicFiles = files.filter(f => {
+    const ext = f.name.split('.').pop().toLowerCase();
+    return musicExts.includes(ext);
+  });
+  return files.map(f => {
+    const baseName = f.name.replace(/\.[^.]+$/, '').toLowerCase();
+    const music = musicFiles.find(m => {
+      const mBase = m.name.replace(/\.[^.]+$/, '').toLowerCase();
+      return mBase === baseName;
+    });
+    return { ...f, musicFileId: music ? music.id : null, musicFileName: music ? music.name : null };
+  });
+}
+
+// Google Drive 파일 직접 스트리밍 URL
+function driveStreamUrl(fileId){
+  return `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`;
 }
 
 function gFetch(url){
@@ -657,6 +688,7 @@ function renderGrid(){
             <div class="tags">
               <span class="tag tag-f ${fm2?.fc||''}">${f.folderName}</span>
               ${ml?`<span class="tag tag-t">${ml}</span>`:''}
+              ${f.musicFileId?`<span class="tag" style="background:rgba(176,88,32,.12);border:1px solid rgba(176,88,32,.22);color:var(--ember2)">&#9834; 음악</span>`:''}
             </div>
           </div>
         </div>
@@ -708,33 +740,126 @@ function renderViewer(){
   const nav  = body.querySelector('.vnw');
   body.innerHTML=''; body.appendChild(nav);
 
-  // Google Drive 미리보기 URL 생성
   const mime = f.mimeType||'';
-  let embedUrl = null;
+  const ext  = (f.name.split('.').pop()||'').toLowerCase();
 
+  // ── 음악 시작 ──────────────────────────────
+  stopMusic();
+  if(f.musicFileId){
+    startMusic(f.musicFileId, f.musicFileName);
+  }
+
+  // ── MP4 동영상 ─────────────────────────────
+  if(mime.includes('video') || ext==='mp4' || ext==='webm' || ext==='mov'){
+    const wrap = document.createElement('div');
+    wrap.style.cssText='width:100%;height:100%;display:flex;align-items:center;justify-content:center;';
+    const video = document.createElement('video');
+    video.controls = true;
+    video.autoplay = true;
+    video.style.cssText='max-width:100%;max-height:100%;border-radius:10px;box-shadow:0 8px 48px rgba(0,0,0,.65);';
+    video.src = `https://drive.google.com/file/d/${f.id}/preview`;
+    // 영상 끝나면 자동 다음
+    video.addEventListener('ended', ()=>{ if(vIdx < vList.length-1) navP(1); });
+    wrap.appendChild(video);
+    body.appendChild(wrap);
+    return;
+  }
+
+  // ── 이미지 ────────────────────────────────
   if(mime.includes('image')){
-    // 이미지: 직접 표시
     const img = document.createElement('img');
     img.className='vimg';
-    img.src=`https://drive.google.com/thumbnail?id=${f.id}&sz=w1600&authuser=0`;
+    img.src=`https://drive.google.com/thumbnail?id=${f.id}&sz=w1600`;
     img.onerror=()=>{ img.src=`https://lh3.googleusercontent.com/d/${f.id}`; };
     body.appendChild(img);
     return;
   }
 
-  // Google Docs/Slides/Sheets → 미리보기 URL
-  if(mime.includes('vnd.google-apps')){
-    embedUrl = `https://drive.google.com/file/d/${f.id}/preview`;
-  } else {
-    // 일반 파일 (PPT, PDF, DOCX 등) → Office Viewer 또는 Drive 뷰어
-    embedUrl = `https://drive.google.com/file/d/${f.id}/preview`;
-  }
-
+  // ── PPSX 슬라이드쇼 ───────────────────────
+  // Drive preview가 PPSX를 슬라이드쇼로 자동 실행
+  const embedUrl = `https://drive.google.com/file/d/${f.id}/preview`;
   const iframe = document.createElement('iframe');
   iframe.className='vframe';
   iframe.src = embedUrl;
   iframe.allow = 'autoplay';
+  // PPSX/MP4 음악 끝나면 자동 다음
+  iframe.onload = ()=>{
+    if(f.musicFileId) return; // 음악있으면 음악이 제어
+  };
   body.appendChild(iframe);
+}
+
+// ── 음악 플레이어 ──────────────────────────────────────────
+let currentAudio = null;
+
+function startMusic(fileId, fileName){
+  const bar = document.getElementById('mbar');
+  bar.classList.add('on');
+  document.getElementById('mname').textContent = fileName||'배경 음악';
+
+  // Drive 파일 스트리밍 (Bearer 토큰 필요)
+  const audio = new Audio();
+  audio.crossOrigin = 'anonymous';
+  currentAudio = audio;
+
+  // fetch로 Blob URL 생성
+  fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,{
+    headers:{Authorization:'Bearer '+accessToken}
+  }).then(r=>r.blob()).then(blob=>{
+    audio.src = URL.createObjectURL(blob);
+    audio.loop = false;
+    audio.play().then(()=>{
+      document.getElementById('mpbtn').innerHTML='&#9646;&#9646;';
+      document.getElementById('meq').classList.remove('paused');
+    }).catch(()=>{});
+    audio.addEventListener('timeupdate',()=>{
+      if(!audio.duration) return;
+      document.getElementById('mprogf').style.width=(audio.currentTime/audio.duration*100)+'%';
+      const s=Math.floor(audio.currentTime);
+      document.getElementById('mtime').textContent=`${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
+    });
+    audio.addEventListener('ended',()=>{
+      // 음악 끝나면 자동 다음 작품
+      if(vIdx < vList.length-1){ navP(1); }
+      else { stopMusic(); }
+    });
+  }).catch(e=>console.error('음악 로드 실패',e));
+}
+
+function stopMusic(){
+  const bar = document.getElementById('mbar');
+  bar.classList.remove('on');
+  if(currentAudio){
+    currentAudio.pause();
+    if(currentAudio.src) URL.revokeObjectURL(currentAudio.src);
+    currentAudio = null;
+  }
+  document.getElementById('mpbtn').innerHTML='&#9654;';
+  document.getElementById('meq').classList.add('paused');
+  document.getElementById('mprogf').style.width='0%';
+  document.getElementById('mtime').textContent='0:00';
+}
+
+function toggleM(){
+  if(!currentAudio) return;
+  if(currentAudio.paused){
+    currentAudio.play();
+    document.getElementById('mpbtn').innerHTML='&#9646;&#9646;';
+    document.getElementById('meq').classList.remove('paused');
+  } else {
+    currentAudio.pause();
+    document.getElementById('mpbtn').innerHTML='&#9654;';
+    document.getElementById('meq').classList.add('paused');
+  }
+}
+function toggleMute(){
+  if(!currentAudio) return;
+  currentAudio.muted=!currentAudio.muted;
+  document.getElementById('mmute').innerHTML=currentAudio.muted?'&#128264;':'&#128266;';
+}
+function seekM(e){
+  if(!currentAudio||!currentAudio.duration) return;
+  currentAudio.currentTime=(e.offsetX/document.getElementById('mprog').offsetWidth)*currentAudio.duration;
 }
 
 function navP(dir){
